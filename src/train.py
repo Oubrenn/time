@@ -4,7 +4,14 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, random_split
 
-from datasets import SyntheticTimeSeriesDataset, ViewConfig
+from datasets import (
+    M4WindowDataset,
+    SlidingWindowDataset,
+    SyntheticTimeSeriesDataset,
+    UEAClassificationDataset,
+    ViewConfig,
+    load_csv_series,
+)
 from losses import ta_cfc_loss, tf_consistency_loss
 from models import MultiViewModel
 from transforms import stft_magnitude
@@ -15,12 +22,15 @@ def collate_fn(batch):
     x_freq = torch.stack([b["x_freq"] for b in batch])
     x_scale = torch.stack([b["x_scale"][0] for b in batch])
     x_color = torch.stack([b["x_color"] for b in batch])
-    return {
+    payload = {
         "x_time": x_time,
         "x_freq": x_freq,
         "x_scale": x_scale,
         "x_color": x_color,
     }
+    if "y" in batch[0]:
+        payload["y"] = torch.tensor([b["y"] for b in batch], dtype=torch.long)
+    return payload
 
 
 def run_epoch(model, loader, optimizer=None, device="cpu", ta_mode="vicreg"):
@@ -56,14 +66,63 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--ta-mode", type=str, default="vicreg", choices=["vicreg", "infonce"])
+    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "uea", "csv", "m4"])
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--uea-name", type=str, default="SpokenArabicDigits")
+    parser.add_argument("--csv-path", type=str, default="")
+    parser.add_argument("--window-length", type=int, default=512)
+    parser.add_argument("--window-stride", type=int, default=64)
     args = parser.parse_args()
 
     view_config = ViewConfig()
-    dataset = SyntheticTimeSeriesDataset(num_samples=200, length=1024, view_config=view_config)
-    train_len = int(0.7 * len(dataset))
-    val_len = int(0.15 * len(dataset))
-    test_len = len(dataset) - train_len - val_len
-    train_set, val_set, test_set = random_split(dataset, [train_len, val_len, test_len])
+    if args.dataset == "synthetic":
+        dataset = SyntheticTimeSeriesDataset(num_samples=200, length=1024, view_config=view_config)
+        train_len = int(0.7 * len(dataset))
+        val_len = int(0.15 * len(dataset))
+        test_len = len(dataset) - train_len - val_len
+        train_set, val_set, test_set = random_split(dataset, [train_len, val_len, test_len])
+    elif args.dataset == "uea":
+        full_train = UEAClassificationDataset(
+            root=args.data_dir,
+            name=args.uea_name,
+            split="train",
+            view_config=view_config,
+        )
+        test_set = UEAClassificationDataset(
+            root=args.data_dir,
+            name=args.uea_name,
+            split="test",
+            view_config=view_config,
+        )
+        val_len = max(1, int(0.15 * len(full_train)))
+        train_len = len(full_train) - val_len
+        train_set, val_set = random_split(full_train, [train_len, val_len])
+    elif args.dataset == "csv":
+        if not args.csv_path:
+            raise ValueError("--csv-path is required for csv datasets")
+        series = SlidingWindowDataset(
+            series=load_csv_series(Path(args.csv_path)),
+            window=args.window_length,
+            stride=args.window_stride,
+            view_config=view_config,
+        )
+        train_len = int(0.7 * len(series))
+        val_len = int(0.15 * len(series))
+        test_len = len(series) - train_len - val_len
+        train_set, val_set, test_set = random_split(series, [train_len, val_len, test_len])
+    else:
+        if not args.csv_path:
+            raise ValueError("--csv-path is required for m4 datasets")
+        dataset = M4WindowDataset(
+            path=args.csv_path,
+            window=args.window_length,
+            stride=args.window_stride,
+            view_config=view_config,
+        )
+        train_len = int(0.7 * len(dataset))
+        val_len = int(0.15 * len(dataset))
+        test_len = len(dataset) - train_len - val_len
+        train_set, val_set, test_set = random_split(dataset, [train_len, val_len, test_len])
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
